@@ -29,7 +29,6 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -60,7 +59,7 @@ class SubscriptionServiceTest {
     @Test
     void subscribeCreatesActiveSubscriptionWithExpiryFromPlan() {
         when(userService.getEntity(1L)).thenReturn(user);
-        when(subscriptionRepository.existsByUserIdAndStatus(1L, SubscriptionStatus.ACTIVE)).thenReturn(false);
+        when(subscriptionRepository.findByUserIdAndStatus(1L, SubscriptionStatus.ACTIVE)).thenReturn(Optional.empty());
         when(planRepository.findByBillingCycle(BillingCycle.MONTHLY)).thenReturn(Optional.of(monthly));
         when(tierRepository.findByName(TierName.SILVER)).thenReturn(Optional.of(silver));
         when(subscriptionRepository.save(any(Subscription.class))).thenAnswer(i -> i.getArgument(0));
@@ -75,14 +74,31 @@ class SubscriptionServiceTest {
     }
 
     @Test
-    void subscribeRejectedWhenUserAlreadyHasActiveSubscription() {
+    void subscribeRejectedWhenUserAlreadyHasLiveSubscription() {
+        Subscription live = Subscription.start(user, monthly, silver, LocalDate.of(2026, 1, 5));
         when(userService.getEntity(1L)).thenReturn(user);
-        when(subscriptionRepository.existsByUserIdAndStatus(1L, SubscriptionStatus.ACTIVE)).thenReturn(true);
+        when(subscriptionRepository.findByUserIdAndStatus(1L, SubscriptionStatus.ACTIVE)).thenReturn(Optional.of(live));
 
         assertThatThrownBy(() -> service.subscribe(new SubscribeRequest(1L, BillingCycle.MONTHLY, TierName.SILVER)))
                 .isInstanceOf(BusinessRuleException.class)
                 .hasMessageContaining("already has an active subscription");
         verify(subscriptionRepository, never()).save(any());
+    }
+
+    @Test
+    void subscribeExpiresEndedSubscriptionThenCreatesNewOne() {
+        Subscription ended = Subscription.start(user, monthly, silver, LocalDate.of(2025, 1, 1));
+        when(userService.getEntity(1L)).thenReturn(user);
+        when(subscriptionRepository.findByUserIdAndStatus(1L, SubscriptionStatus.ACTIVE)).thenReturn(Optional.of(ended));
+        when(planRepository.findByBillingCycle(BillingCycle.MONTHLY)).thenReturn(Optional.of(monthly));
+        when(tierRepository.findByName(TierName.SILVER)).thenReturn(Optional.of(silver));
+        when(subscriptionRepository.save(any(Subscription.class))).thenAnswer(i -> i.getArgument(0));
+
+        SubscriptionResponse response =
+                service.subscribe(new SubscribeRequest(1L, BillingCycle.MONTHLY, TierName.SILVER));
+
+        assertThat(ended.getStatus()).isEqualTo(SubscriptionStatus.EXPIRED);
+        assertThat(response.status()).isEqualTo(SubscriptionStatus.ACTIVE);
     }
 
     @Test
@@ -98,14 +114,12 @@ class SubscriptionServiceTest {
     }
 
     @Test
-    void expireOverdueExpiresOnlyReturnedSubscriptions() {
-        Subscription overdue = Subscription.start(user, monthly, silver, LocalDate.of(2025, 1, 1));
-        when(subscriptionRepository.findByStatusAndEndDateBefore(eq(SubscriptionStatus.ACTIVE), any()))
-                .thenReturn(java.util.List.of(overdue));
+    void getCurrentSubscriptionExpiresEndedSubscriptionAndReportsNone() {
+        Subscription ended = Subscription.start(user, monthly, silver, LocalDate.of(2025, 1, 1));
+        when(subscriptionRepository.findByUserIdAndStatus(1L, SubscriptionStatus.ACTIVE)).thenReturn(Optional.of(ended));
 
-        int expired = service.expireOverdue();
-
-        assertThat(expired).isEqualTo(1);
-        assertThat(overdue.getStatus()).isEqualTo(SubscriptionStatus.EXPIRED);
+        assertThatThrownBy(() -> service.getCurrentSubscription(1L))
+                .isInstanceOf(com.firstclub.membership.exception.ResourceNotFoundException.class);
+        assertThat(ended.getStatus()).isEqualTo(SubscriptionStatus.EXPIRED);
     }
 }

@@ -23,7 +23,6 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
-import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -87,19 +86,20 @@ class MembershipActivityServiceTest {
     }
 
     @Test
-    void windowResetReevaluatesAndDowngradesWhenSpendDropsOff() {
+    void recordingFirstOrderOfNewMonthRollsTheSpendWindow() {
         MembershipActivity activity = new MembershipActivity(user, LocalDate.of(2026, 1, 1));
-        activity.recordOrder(new BigDecimal("9000"));
-        Subscription subscription = Subscription.start(user, monthly, gold, LocalDate.of(2026, 1, 1));
-        when(activityRepository.findByWindowStartBefore(any())).thenReturn(List.of(activity));
+        activity.recordOrder(new BigDecimal("9000")); // spend from the previous, now-stale window
+        Subscription subscription = Subscription.start(user, monthly, silver, LocalDate.of(2026, 3, 1));
+        when(userService.getEntity(1L)).thenReturn(user);
+        when(activityRepository.findByUserId(1L)).thenReturn(Optional.of(activity));
         when(tierEvaluator.evaluate(any(), any())).thenReturn(silver);
         when(subscriptionRepository.findByUserIdAndStatus(1L, SubscriptionStatus.ACTIVE))
                 .thenReturn(Optional.of(subscription));
 
-        int reset = service.resetMonthlyWindows();
+        OrderRecordedResponse response = service.recordOrder(1L, new BigDecimal("200"));
 
-        assertThat(reset).isEqualTo(1);
-        assertThat(activity.getMonthlySpend()).isEqualByComparingTo("0");
-        assertThat(subscription.getTier()).isEqualTo(silver);
+        assertThat(activity.getWindowStart()).isEqualTo(LocalDate.of(2026, 3, 1));
+        assertThat(response.monthlySpend()).isEqualByComparingTo("200");
+        assertThat(response.totalSpend()).isEqualByComparingTo("9200");
     }
 }

@@ -57,13 +57,54 @@ erDiagram
     TIER ||--o{ BENEFIT : unlocks
     TIER ||--|| TIER_CRITERIA : "qualified by"
 
-    USER { long id PK; string name; string email UK; string cohort; timestamp created_at }
-    PLAN { long id PK; string billing_cycle UK; decimal price }
-    TIER { long id PK; string name UK; int level }
-    BENEFIT { long id PK; long tier_id FK; string type; string benefit_value }
-    TIER_CRITERIA { long id PK; long tier_id FK; int min_order_count; decimal min_monthly_spend; string required_cohort }
-    SUBSCRIPTION { long id PK; long user_id FK; long plan_id FK; long tier_id FK; string status; date start_date; date end_date; long version }
-    MEMBERSHIP_ACTIVITY { long id PK; long user_id FK; int order_count; decimal monthly_spend; decimal total_spend; date window_start }
+    USER {
+        long id PK
+        string name
+        string email UK
+        string cohort
+        timestamp created_at
+    }
+    PLAN {
+        long id PK
+        string billing_cycle UK
+        decimal price
+    }
+    TIER {
+        long id PK
+        string name UK
+        int level
+    }
+    BENEFIT {
+        long id PK
+        long tier_id FK
+        string type
+        string benefit_value
+    }
+    TIER_CRITERIA {
+        long id PK
+        long tier_id FK
+        int min_order_count
+        decimal min_monthly_spend
+        string required_cohort
+    }
+    SUBSCRIPTION {
+        long id PK
+        long user_id FK
+        long plan_id FK
+        long tier_id FK
+        string status
+        date start_date
+        date end_date
+        long version
+    }
+    MEMBERSHIP_ACTIVITY {
+        long id PK
+        long user_id FK
+        int order_count
+        decimal monthly_spend
+        decimal total_spend
+        date window_start
+    }
 ```
 
 ---
@@ -89,10 +130,6 @@ flowchart TD
         TE[TierEvaluator]
         TR1[TierRule strategies]
     end
-    subgraph Scheduler
-        EXP[SubscriptionExpiryScheduler]
-        WIN[MonthlyWindowResetScheduler]
-    end
     subgraph Data
         REPO[(JPA Repositories)]
         DB[(H2 + Flyway)]
@@ -104,8 +141,6 @@ flowchart TD
     AC --> AS
     AS --> TE
     TE --> TR1
-    EXP --> SS
-    WIN --> AS
     CS --> REPO
     US --> REPO
     SS --> REPO
@@ -124,7 +159,6 @@ com.firstclub.membership
 ├── exception/     Domain exceptions + @RestControllerAdvice
 ├── mapper/        Entity → DTO mapping (manual, static)
 ├── repository/    Spring Data JPA repositories
-├── scheduler/     Expiry + window-reset jobs
 └── service/
     └── tier/      Tier evaluation Strategy (TierEvaluator + TierRule rules)
 ```
@@ -205,25 +239,31 @@ Status codes: `201` create, `200` reads/updates, `400` validation, `404` not fou
   cancelled) and `MembershipActivity` (`recordOrder`/`resetMonthlyWindow`). Services orchestrate;
   they don't re-implement domain maths.
 - **Configurable benefits and criteria.** Both are rows in the database (`benefits`,
-  `tier_criteria`) seeded by Flyway, so perks and thresholds change without a redeploy.
-- **Upgrade-on-order, downgrade-on-reset.** Recording an order only ever raises a tier (metrics
-  grow monotonically within a window), so a member is never demoted mid-window. Downgrades are
-  applied when the monthly window resets and spend rolls back to zero.
+  `tier_criteria`) seeded by Flyway, so perks and thresholds change without a redeploy. Platinum,
+  for example, additionally requires the `PREMIUM` cohort — exercising the cohort criterion.
+- **Automatic upgrades only.** Recording an order can only raise a tier (spend and order count grow
+  monotonically within a window), so a member is never demoted behind their back. Downgrades are an
+  explicit user action via `PATCH .../tier`.
+- **Lazy expiry and window rollover, no scheduler.** A subscription past its end date is expired the
+  next time it is read or when the member re-subscribes; a stale monthly spend window is rolled over
+  on the member's first order of a new month. This keeps "current membership and expiry" and
+  "spend in a month" correct without a background job to operate and reason about.
 - **Manual mapping over a mapping framework.** The DTO mapping is small and explicit; MapStruct
   would add a dependency and generated code for no real benefit.
 - **`Clock` bean.** All "today" reads go through an injected `Clock`, so time-dependent logic
-  (expiry, window resets) is tested with a fixed clock instead of the wall clock.
+  (expiry, window rollover) is tested with a fixed clock instead of the wall clock.
 
 ---
 
 ## Concurrency
 
-`Subscription` carries a JPA `@Version` column (optimistic locking). Upgrade, downgrade, cancel,
-and the scheduled expiry job all mutate subscriptions, and a member could trigger several of these
-at once (e.g. a double-tapped "upgrade" while the nightly expiry job runs). With optimistic
-locking, the second write to a stale version fails fast with
-`ObjectOptimisticLockingFailureException`, which the exception handler maps to `409 Conflict`
-("updated concurrently, please retry") instead of silently overwriting the first change.
+`Subscription` carries a JPA `@Version` column (optimistic locking). Upgrade, downgrade, cancel, and
+the automatic tier upgrade that fires when an order is recorded all mutate subscriptions, and a
+member could trigger several of these at once (e.g. a double-tapped "upgrade", or an upgrade landing
+at the same moment an order auto-upgrades the tier). With optimistic locking, the second write to a
+stale version fails fast with `ObjectOptimisticLockingFailureException`, which the exception handler
+maps to `409 Conflict` ("updated concurrently, please retry") instead of silently overwriting the
+first change.
 
 Optimistic locking is chosen over pessimistic locking or `synchronized` because contention on a
 single subscription is rare; paying for a lock on every read would be the wrong trade-off, and
@@ -238,8 +278,9 @@ single subscription is rare; paying for a lock on every read would be the wrong 
 - A user holds at most one **active** subscription at a time. H2 has no partial unique index, so
   this is enforced in the service layer; the equivalent PostgreSQL partial index is documented in
   `V1__schema.sql`.
-- The monthly spend window is a rolling one-month period per member; a real system would likely
-  align it to calendar months or the billing anchor date.
+- The monthly spend window is a rolling one-month period per member, rolled over lazily on the
+  member's first order in a new month; a real system would likely align it to calendar months or
+  the billing anchor date, possibly via a scheduled job.
 - Authentication/authorization is out of scope for this assignment.
 
 ## Future improvements
@@ -251,4 +292,4 @@ single subscription is rare; paying for a lock on every read would be the wrong 
 - Add integration tests (`@SpringBootTest`) covering the full HTTP + persistence path alongside the
   current unit tests.
 - Switch to PostgreSQL with the partial unique index for the one-active-subscription invariant.
-```
+- Add a scheduled job for time-based expiry/window rollover if eager, batch processing is ever needed.

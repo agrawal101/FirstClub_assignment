@@ -20,7 +20,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.LocalDate;
-import java.util.List;
 import java.util.Optional;
 
 /**
@@ -47,6 +46,10 @@ public class MembershipActivityService {
         MembershipActivity activity = activityRepository.findByUserId(userId)
                 .orElseThrow(() -> new ResourceNotFoundException("No membership activity for user: " + userId));
 
+        LocalDate today = LocalDate.now(clock);
+        if (activity.getWindowStart().isBefore(today.minusMonths(1))) {
+            activity.resetMonthlyWindow(today);
+        }
         activity.recordOrder(amount);
         Tier qualified = tierEvaluator.evaluate(user, activity);
         TierName currentTier = applyUpgradeIfQualified(userId, qualified);
@@ -55,38 +58,6 @@ public class MembershipActivityService {
                 userId, activity.getOrderCount(), activity.getMonthlySpend(), currentTier);
         return new OrderRecordedResponse(
                 activity.getOrderCount(), activity.getMonthlySpend(), activity.getTotalSpend(), currentTier);
-    }
-
-    /**
-     * Opens a fresh monthly spend window for members whose window is over a month old, then
-     * re-evaluates their tier. Because spend resets to zero, this is the path where a member can
-     * be downgraded. Invoked by the monthly window-reset scheduler; returns the number reset.
-     */
-    @Transactional
-    public int resetMonthlyWindows() {
-        LocalDate today = LocalDate.now(clock);
-        List<MembershipActivity> due = activityRepository.findByWindowStartBefore(today.minusMonths(1));
-        for (MembershipActivity activity : due) {
-            activity.resetMonthlyWindow(today);
-            Tier qualified = tierEvaluator.evaluate(activity.getUser(), activity);
-            applyQualifiedTier(activity.getUser().getId(), qualified);
-        }
-        if (!due.isEmpty()) {
-            log.info("Reset monthly window for {} member(s)", due.size());
-        }
-        return due.size();
-    }
-
-    /** Sets the active subscription to the qualified tier in either direction (upgrade or downgrade). */
-    private void applyQualifiedTier(Long userId, Tier qualified) {
-        subscriptionRepository.findByUserIdAndStatus(userId, SubscriptionStatus.ACTIVE)
-                .ifPresent(subscription -> {
-                    if (subscription.getTier().getLevel() != qualified.getLevel()) {
-                        log.info("Re-evaluated subscription {}: {} -> {}",
-                                subscription.getId(), subscription.getTier().getName(), qualified.getName());
-                        subscription.changeTier(qualified);
-                    }
-                });
     }
 
     /**
